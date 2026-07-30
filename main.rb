@@ -38,7 +38,7 @@ class RleDecoder
     return Array.new(total, 0) if total == 0 || rle.nil? || rle.empty?
 
     bytes = rle.unpack1("m0").bytes
-    # puts "  Decoding RLE: #{bytes}"
+
     explicit_runs = unpack_run_lengths(bytes)
     sum_explicit = explicit_runs.sum
     implicit_len = total - sum_explicit
@@ -97,7 +97,6 @@ class UpdCli
 
   # List all entry IDs in the UPD file.
   def list_entry_ids(upd_file)
-    puts @cli
     output = run_cmd("#{@cli} --input #{Shellwords.escape(upd_file)} entry list")
     parse_id_list(output, json: true)
   end
@@ -243,23 +242,19 @@ class MaskDecoder
 
     n_cols = (width.to_f / TILE_SIZE).ceil
     n_rows = (height.to_f / TILE_SIZE).ceil
-    puts n_rows, n_cols
     n_rows.times do |row|
       n_cols.times do |col|
         tile_key = "tile-#{col}x#{row}"
 
-
-        puts "  Processing tile: #{shape[tile_key]}"
         tile_data = shape[tile_key]
         next if tile_data.nil?
 
-        # tile_data can be {"rle" => "base64..."} or the RLE string directly
         rle = tile_data.is_a?(Hash) ? tile_data["rle"] : tile_data
 
         next unless rle.is_a?(String) && !rle.empty?
 
         tile_pixels = @rle_decoder.decode(rle, TILE_SIZE, TILE_SIZE)
-        # puts "  Processing tile_pixels: #{tile_pixels}"
+
         TILE_SIZE.times do |py|
           img_y = row * TILE_SIZE + py
           next if img_y >= height
@@ -362,7 +357,6 @@ def main
   FileUtils.mkdir_p(output_dir)
 
   # Step 1: List all entries and annotations
-  puts "Reading UPD file: #{options[:input]}"
   entries = updcli.list_entry_ids(options[:input])
   annotation_ids = updcli.list_annotation_ids(options[:input])
 
@@ -372,7 +366,7 @@ def main
   entry_names = {}
   entries.each do |eid|
     entry_data = updcli.show_entry(options[:input], eid)
-    puts "  Processing entry: #{eid} (entry_data: #{entry_data})"
+
     next unless entry_data
 
     # The entry show output has: { "id" => "...", "media_url" => "local:...?name=..." }
@@ -400,7 +394,6 @@ def main
     # Get entry_id from annotation data
     # The exporter now embeds _entry_id and _metadata in the annotation field
     # since `annotation show` doesn't return the top-level entry_id or metadata
-    puts "Processing annotation: #{aid} (annotation: #{annotation})"
     ann_data = annotation["annotation"] || {}
     entry_id = ann_data["_entry_id"] || annotation["entry_id"]
     entry_name = entry_names[entry_id] || entry_id || annotation["id"] || "unknown"
@@ -415,13 +408,11 @@ def main
     else
       output_path = File.join(output_dir, "#{entry_name}__mask.png")
     end
-    # puts annotation
+
     # Get shape data — the shape is stored under "shape_args" key
     # For mask annotations, the shape contains tile keys like "tile-0x0"
     # Filter out non-tile keys (e.g. "points" which is an array)
     shape = (annotation["shape_args"] || {}).select { |k, _| k.start_with?("tile-") }
-
-    puts "shape: #{shape}"
 
     # Determine dimensions from metadata
     metadata = annotation["metadata"] || {}
@@ -449,7 +440,6 @@ def main
       end
     end
 
-    # puts output_path
     # Decode mask
     puts "  Decoding: #{File.basename(output_path)} (#{width}x#{height})"
     begin
