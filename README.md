@@ -2,7 +2,24 @@
 
 Extracts all `binary_mask` annotations from a UPD (Universal Portable Dataset) file and converts them to PNG mask images.
 
-Each mask is saved as `<entry-name>__<category>.png` in the output directory.
+## Output Structure
+
+Masks are organized into category-named subfolders. For entries with at least one category, a combined RGB mask is also generated in a `combined/` subfolder.
+
+```
+mask_output/
+  <category-1>/
+    <entry-name-1>.png
+    <entry-name-2>.png
+  <category-2>/
+    <entry-name-1>.png
+  combined/
+    <entry-name-1>.png   (combined, color-coded: category-1=red, category-2=green, ...)
+    <entry-name-2>.png   (combined, color-coded: category-1=red)
+```
+
+- **Per-category masks**: Saved as `<output-dir>/<category>/<entry-name>.png` — grayscale (white = mask, black = background)
+- **Combined masks**: Saved as `<output-dir>/combined/<entry-name>.png` — RGB, each category shown in a distinct color (16-color palette, cycles for more than 16 categories). Every entry with at least one categorized mask gets a combined mask.
 
 ## Requirements
 
@@ -42,7 +59,9 @@ The script walks the UPD file structure automatically:
    - Extracts the shape data (tile keys with RLE-encoded binary masks)
    - Decodes each tile: Base64 → raw bytes → varint unpack → RLE → 128×128 pixel buffer
    - Assembles tiles into the full image grid
-   - Saves as `<entry-name>__<category>.png`
+   - Groups masks by entry and category
+4. Writes per-category masks into `<category>/` subfolders
+5. Generates combined RGB masks in a `combined/` subfolder (color-coded by category)
 
 ## Decoding Pipeline
 
@@ -79,7 +98,11 @@ For each binary_mask annotation:
    Assemble tiles into full image grid
        |
        v
-   <entry-name>__<category>.png
+   Group by entry + category
+       |
+       v
+   <category>/<entry-name>.png  (per-category grayscale)
+   combined/<entry-name>.png    (combined RGB, color-coded)
 ```
 
 ## License

@@ -277,6 +277,7 @@ end
 # PNG Writer
 # ─────────────────────────────────────────────────────────────────────────────
 class PngWriter
+  # Write a grayscale (binary) mask PNG.
   def write(image, path)
     height = image.length
     width = image[0].length
@@ -288,7 +289,44 @@ class PngWriter
     end
   end
 
+  # Write a combined RGB mask where each category index maps to a distinct color.
+  # The `combined_image` is a 2D array [y][x] of integer category indices (0 = background).
+  def write_combined(combined_image, path)
+    height = combined_image.length
+    width = combined_image[0].length
+
+    if HAVE_CHUNKY_PNG
+      write_combined_chunky(combined_image, width, height, path)
+    else
+      write_combined_minimal(combined_image, width, height, path)
+    end
+  end
+
   private
+
+  # Pre-defined palette of distinct colors (index 0 = background = black).
+  CATEGORY_COLORS = [
+    [0, 0, 0],       # 0: background (black)
+    [255, 0, 0],     # 1: red
+    [0, 255, 0],     # 2: green
+    [0, 0, 255],     # 3: blue
+    [255, 255, 0],   # 4: yellow
+    [255, 0, 255],   # 5: magenta
+    [0, 255, 255],   # 6: cyan
+    [255, 128, 0],   # 7: orange
+    [128, 0, 255],   # 8: purple
+    [0, 255, 128],   # 9: spring green
+    [255, 0, 128],   # 10: rose
+    [128, 255, 0],   # 11: chartreuse
+    [0, 128, 255],   # 12: azure
+    [255, 128, 128], # 13: light red
+    [128, 255, 128], # 14: light green
+    [128, 128, 255], # 15: light blue
+  ].freeze
+
+  def category_color(index)
+    CATEGORY_COLORS[index % CATEGORY_COLORS.length]
+  end
 
   def write_with_chunky_png(image, width, height, path)
     png = ChunkyPNG::Image.new(width, height)
@@ -297,6 +335,20 @@ class PngWriter
       width.times do |x|
         pixel = image[y][x]
         png[x, y] = pixel == 1 ? ChunkyPNG::Color.rgb(255, 255, 255) : ChunkyPNG::Color.rgb(0, 0, 0)
+      end
+    end
+
+    png.save(path)
+  end
+
+  def write_combined_chunky(combined_image, width, height, path)
+    png = ChunkyPNG::Image.new(width, height)
+
+    height.times do |y|
+      width.times do |x|
+        idx = combined_image[y][x]
+        r, g, b = category_color(idx)
+        png[x, y] = ChunkyPNG::Color.rgb(r, g, b)
       end
     end
 
@@ -315,6 +367,35 @@ class PngWriter
       raw_data << 0x00 # filter byte (none)
       width.times do |x|
         raw_data << (image[y][x] == 1 ? 255 : 0).chr
+      end
+    end
+
+    compressed = Zlib::Deflate.deflate(raw_data)
+    idat = build_chunk("IDAT", compressed)
+    iend = build_chunk("IEND", "")
+
+    File.open(path, "wb") do |f|
+      f.write(signature)
+      f.write(ihdr)
+      f.write(idat)
+      f.write(iend)
+    end
+  end
+
+  def write_combined_minimal(combined_image, width, height, path)
+    signature = [137, 80, 78, 71, 13, 10, 26, 10].pack("C*")
+
+    # 8-bit truecolor (RGB)
+    ihdr_data = [width, height].pack("N2") + [8, 2, 0, 0, 0].pack("C5")
+    ihdr = build_chunk("IHDR", ihdr_data)
+
+    raw_data = +""
+    height.times do |y|
+      raw_data << 0x00 # filter byte (none)
+      width.times do |x|
+        idx = combined_image[y][x]
+        r, g, b = category_color(idx)
+        raw_data << r.chr << g.chr << b.chr
       end
     end
 
@@ -362,22 +443,28 @@ def main
 
   puts "  Found #{entries.length} entries, #{annotation_ids.length} annotations"
 
-  # Step 2: Fetch entry metadata (build a map entry_id → name)
-  entry_names = {}
+  # Step 2: Fetch entry metadata (build a map entry_id → name + dimensions)
+  # The entry show output has: { "id" => "...", "metadata" => { "name" => "...", "width" => ..., "height" => ... } }
+  entry_info = {}
   entries.each do |eid|
     entry_data = updcli.show_entry(options[:input], eid)
-
     next unless entry_data
 
-    # The entry show output has: { "id" => "...", "media_url" => "local:...?name=..." }
-    # Extract the entry name from the media_url query param
-    media_url = entry_data["media_url"] || ""
-    name_from_url = media_url[/[?&]name=([^&]+)/, 1]
-    entry_names[eid] = name_from_url || eid
+    metadata = entry_data["metadata"] || {}
+    name = metadata["Name"] || eid
+    img_w = normalize_dim_value(metadata["Original-Width"])
+    img_h = normalize_dim_value(metadata["Original-Height"])
+
+    entry_info[eid] = {
+      name: name,
+      width: img_w,
+      height: img_h
+    }
   end
 
-  # Step 3: Process each annotation
-  success = 0
+  # Step 3: Fetch and decode all mask annotations, grouped by entry_id
+  # Each entry in the map: entry_id => { entry_name:, width:, height:, masks: [...] }
+  entry_masks = {}
   skipped = 0
 
   annotation_ids.each do |aid|
@@ -391,70 +478,152 @@ def main
       next
     end
 
-    # Get entry_id from annotation data
-    # The exporter now embeds _entry_id and _metadata in the annotation field
-    # since `annotation show` doesn't return the top-level entry_id or metadata
-    ann_data = annotation["annotation"] || {}
-    entry_id = ann_data["_entry_id"] || annotation["entry_id"]
-    entry_name = entry_names[entry_id] || entry_id || annotation["id"] || "unknown"
-
-    # Determine category from annotation annotation data
-    category = ann_data["category"] || ""
-
-    # Build output filename: <entry_name>__<category>.png
-    if category && !category.empty?
-      safe_category = category.tr("/", "_")
-      output_path = File.join(output_dir, "#{entry_name}__#{safe_category}.png")
-    else
-      output_path = File.join(output_dir, "#{entry_name}__mask.png")
+    # Get entry_id directly from annotation response
+    entry_id = annotation["entry_id"]
+    unless entry_id
+      warn "  ⚠ Skipping annotation #{aid}: no entry_id"
+      skipped += 1
+      next
     end
 
-    # Get shape data — the shape is stored under "shape_args" key
-    # For mask annotations, the shape contains tile keys like "tile-0x0"
-    # Filter out non-tile keys (e.g. "points" which is an array)
+    info = entry_info[entry_id]
+    entry_name = info ? info[:name] : entry_id
+
+    # Determine category from annotation data
+    ann_data = annotation["annotation"] || {}
+    category = ann_data["category"] || ""
+
+    # Get shape data — filter out non-tile keys (e.g. "points")
     shape = (annotation["shape_args"] || {}).select { |k, _| k.start_with?("tile-") }
 
-    # Determine dimensions from metadata
-    metadata = annotation["metadata"] || {}
-    width = normalize_dim_value(metadata["width"]) || normalize_dim_value(metadata["Width"])
-    height = normalize_dim_value(metadata["height"]) || normalize_dim_value(metadata["Height"])
+    # Determine the full image dimensions.
+    # Prefer the entry's dimensions from entry metadata (authoritative full image size),
+    # then fall back to annotation metadata, then infer from tile keys.
+    if info && info[:width] && info[:height] && info[:width] > 0 && info[:height] > 0
+      width = info[:width]
+      height = info[:height]
+    else
+      ann_metadata = annotation["metadata"] || {}
+      width = normalize_dim_value(ann_metadata["width"]) || normalize_dim_value(ann_metadata["Width"])
+      height = normalize_dim_value(ann_metadata["height"]) || normalize_dim_value(ann_metadata["Height"])
 
-    if width.nil? || height.nil? || width <= 0 || height <= 0
-      # Fallback: infer from tile keys
-      tile_keys = shape.keys.select { |k| k.start_with?("tile-") }
-      if tile_keys.any?
-        max_col = 0
-        max_row = 0
-        tile_keys.each do |key|
-          m = key.match(/tile-(\d+)x(\d+)/)
-          next unless m
-          max_col = m[1].to_i if m[1].to_i > max_col
-          max_row = m[2].to_i if m[2].to_i > max_row
+      if width.nil? || height.nil? || width <= 0 || height <= 0
+        # Fallback: infer from tile keys
+        tile_keys = shape.keys.select { |k| k.start_with?("tile-") }
+        if tile_keys.any?
+          max_col = 0
+          max_row = 0
+          tile_keys.each do |key|
+            m = key.match(/tile-(\d+)x(\d+)/)
+            next unless m
+            max_col = m[1].to_i if m[1].to_i > max_col
+            max_row = m[2].to_i if m[2].to_i > max_row
+          end
+          width  = (max_col + 1) * 128
+          height = (max_row + 1) * 128
+        else
+          warn "  ⚠ Skipping annotation #{aid}: no tile data found"
+          skipped += 1
+          next
         end
-        width  = (max_col + 1) * 128
-        height = (max_row + 1) * 128
-      else
-        warn "  ⚠ Skipping annotation #{aid}: no tile data found"
-        skipped += 1
-        next
       end
     end
 
-    # Decode mask
-    puts "  Decoding: #{File.basename(output_path)} (#{width}x#{height})"
+    # Decode mask at the full entry image dimensions
+    puts "  Decoding mask for entry '#{entry_name}', category '#{category}' (#{width}x#{height})"
     begin
       image = decoder.decode(shape, width, height)
-      writer.write(image, output_path)
-      puts "    → #{output_path}"
-      success += 1
+
+      # Group by entry_id
+      entry_masks[entry_id] ||= { entry_name: entry_name, width: 0, height: 0, masks: [] }
+      entry_masks[entry_id][:width] = [entry_masks[entry_id][:width], width].max
+      entry_masks[entry_id][:height] = [entry_masks[entry_id][:height], height].max
+      entry_masks[entry_id][:masks] << {
+        category: category,
+        image: image,
+        width: width,
+        height: height
+      }
     rescue => e
-      # warn "  ✗ Failed to decode annotation #{aid}: #{e.message}"
       warn e.full_message
       skipped += 1
     end
   end
 
-  puts "\nDone: #{success} mask(s) extracted, #{skipped} skipped"
+  # Step 4: Build a global category-to-index mapping for consistent colors across all entries
+  all_categories = []
+  entry_masks.each_value do |entry_data|
+    entry_data[:masks].each do |m|
+      cat = m[:category]
+      if cat && !cat.empty? && !all_categories.include?(cat)
+        all_categories << cat
+      end
+    end
+  end
+  global_category_indices = {}
+  all_categories.each_with_index do |cat, idx|
+    global_category_indices[cat] = idx + 1
+  end
+
+  # Step 5: Write individual mask files (per-category subfolders) and combined masks
+  success = 0
+  combined_count = 0
+
+  entry_masks.each_value do |entry_data|
+    entry_name = entry_data[:entry_name]
+    masks = entry_data[:masks]
+
+    # Write individual category masks into category-named subfolders
+    masks.each do |mask_data|
+      category = mask_data[:category]
+      image = mask_data[:image]
+
+      if category && !category.empty?
+        safe_category = category.tr("/", "_")
+        cat_dir = File.join(output_dir, safe_category)
+        FileUtils.mkdir_p(cat_dir)
+        output_path = File.join(cat_dir, "#{entry_name}.png")
+      else
+        output_path = File.join(output_dir, "#{entry_name}.png")
+      end
+
+      writer.write(image, output_path)
+      puts "    → #{output_path}"
+      success += 1
+    end
+
+    # Generate a combined mask with each category shown in a different color.
+    # Every entry with at least one category gets a combined mask.
+    categorized_masks = masks.select { |m| m[:category] && !m[:category].empty? }
+    next if categorized_masks.empty?
+
+    # Use the entry's full dimensions for the combined mask
+    combined = Array.new(entry_data[:height]) { Array.new(entry_data[:width], 0) }
+
+    # Merge each category mask into the combined image using its global color index
+    categorized_masks.each do |m|
+      idx = global_category_indices[m[:category]] || 1
+      h = m[:height]
+      w = m[:width]
+      h.times do |y|
+        next if y >= entry_data[:height]
+        w.times do |x|
+          next if x >= entry_data[:width]
+          combined[y][x] = idx if m[:image][y][x] == 1
+        end
+      end
+    end
+
+    # Write combined mask in a combined/ subfolder
+    combined_dir = File.join(output_dir, "combined")
+    FileUtils.mkdir_p(combined_dir)
+    combined_path = File.join(combined_dir, "#{entry_name}.png")
+    writer.write_combined(combined, combined_path)
+    puts "    → #{combined_path} (combined, #{categorized_masks.length} categories)"
+    combined_count += 1
+  end
+
+  puts "\nDone: #{success} individual mask(s) extracted, #{combined_count} combined mask(s) generated, #{skipped} skipped"
 end
 
 def normalize_dim_value(val)
