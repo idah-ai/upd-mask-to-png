@@ -452,8 +452,8 @@ def main
 
     metadata = entry_data["metadata"] || {}
     name = metadata["Name"] || eid
-    img_w = normalize_dim_value(metadata["Original-Width"])
-    img_h = normalize_dim_value(metadata["Original-Height"])
+    img_w = normalize_dim_value(metadata["Width"])
+    img_h = normalize_dim_value(metadata["Height"])
 
     entry_info[eid] = {
       name: name,
