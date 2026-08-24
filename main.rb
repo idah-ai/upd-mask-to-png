@@ -324,31 +324,8 @@ class PngWriter
     [128, 128, 255], # 15: light blue
   ].freeze
 
-  COLOR_NAMES = [
-    "background",     # 0
-    "red",            # 1
-    "green",          # 2
-    "blue",           # 3
-    "yellow",         # 4
-    "magenta",        # 5
-    "cyan",           # 6
-    "orange",         # 7
-    "purple",         # 8
-    "spring green",   # 9
-    "rose",           # 10
-    "chartreuse",     # 11
-    "azure",          # 12
-    "light red",      # 13
-    "light green",    # 14
-    "light blue",     # 15
-  ].freeze
-
   def category_color(index)
     CATEGORY_COLORS[index % CATEGORY_COLORS.length]
-  end
-
-  def color_name(index)
-    "#{COLOR_NAMES[index % COLOR_NAMES.length]} (#{CATEGORY_COLORS[index % CATEGORY_COLORS.length].inspect})"
   end
 
   def write_with_chunky_png(image, width, height, path)
