@@ -324,8 +324,31 @@ class PngWriter
     [128, 128, 255], # 15: light blue
   ].freeze
 
+  COLOR_NAMES = [
+    "background",     # 0
+    "red",            # 1
+    "green",          # 2
+    "blue",           # 3
+    "yellow",         # 4
+    "magenta",        # 5
+    "cyan",           # 6
+    "orange",         # 7
+    "purple",         # 8
+    "spring green",   # 9
+    "rose",           # 10
+    "chartreuse",     # 11
+    "azure",          # 12
+    "light red",      # 13
+    "light green",    # 14
+    "light blue",     # 15
+  ].freeze
+
   def category_color(index)
     CATEGORY_COLORS[index % CATEGORY_COLORS.length]
+  end
+
+  def color_name(index)
+    "#{COLOR_NAMES[index % COLOR_NAMES.length]} (#{CATEGORY_COLORS[index % CATEGORY_COLORS.length].inspect})"
   end
 
   def write_with_chunky_png(image, width, height, path)
@@ -564,6 +587,24 @@ def main
   all_categories.each_with_index do |cat, idx|
     global_category_indices[cat] = idx + 1
   end
+
+  # Write a reference file mapping each category to its assigned hex color
+  colors_path = File.join(output_dir, "category_colors.txt")
+  File.open(colors_path, "w") do |f|
+    f.puts "Category-to-Color Mapping for Combined Masks"
+    f.puts "Generated from UPD file: #{options[:input]}"
+    f.puts "=" * 60
+    f.puts ""
+    all_categories.each_with_index do |cat, idx|
+      color_idx = idx + 1
+      rgb = PngWriter::CATEGORY_COLORS[color_idx % PngWriter::CATEGORY_COLORS.length]
+      hex = "#%02x%02x%02x" % rgb
+      f.puts "  #{cat.ljust(30)} → #{hex}"
+    end
+    f.puts ""
+    f.puts "Note: Index 0 (black / #000000) is reserved for non-masked areas."
+  end
+  puts "  → #{colors_path}"
 
   # Step 5: Write individual mask files (per-category subfolders) and combined masks
   success = 0
