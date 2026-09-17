@@ -724,8 +724,7 @@ def main
   # ───────────────────────────────────────────────────────────────────────
   all_categories = []
   all_annotations.each do |ann|
-    ann_data = ann["annotation"] || {}
-    cat = ann_data["category"] || ""
+    cat = ann["category"] || ""
     if cat && !cat.empty? && !all_categories.include?(cat)
       all_categories << cat
     end
@@ -781,8 +780,7 @@ def main
     entry_annotations.each do |annotation|
       aid = annotation["id"]
       shape_type = annotation["shape_type"] || ""
-      ann_data = annotation["annotation"] || {}
-      category = ann_data["category"] || ""
+      category = annotation["category"] || ""
       shape_args = annotation["shape_args"] || {}
 
       # Extract shape data (tile keys for masks, full args for others)
