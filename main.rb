@@ -129,7 +129,7 @@ class UpdCli
     output = run_cmd("#{@cli} --input #{Shellwords.escape(upd_file)} annotation show --id #{Shellwords.escape(annotation_id)}")
     parse_json_from_log(output)
   end
-# List all annotations with full data in a single subprocess call.
+  # List all annotations with full data in a single subprocess call.
   # Returns an array of annotation hashes with keys: id, entry_id, shape_type,
   # annotation (Hash), shape_args (Hash), metadata (Hash or nil).
   def list_annotations_full(upd_file)
@@ -720,7 +720,7 @@ def main
     }
   end
 
-# ───────────────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────────
   # Step 3: Build global category-to-index mapping for consistent colors
   # ───────────────────────────────────────────────────────────────────────
   all_categories = []
