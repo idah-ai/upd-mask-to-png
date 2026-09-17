@@ -1,14 +1,22 @@
 # frozen_string_literal: true
 
-# UPD Mask Annotation to PNG Converter
+# UPD Annotation to PNG Mask Converter
 #
-# Extracts all binary_mask annotations from a UPD file and converts them
-# to PNG mask images.
+# Extracts annotations from a UPD file and renders them as PNG mask images.
+# Supports:
+#   - idah-image:mask          (binary masks from tile-based RLE encoding)
+#   - idah-image:bounding-box  (bounding box outlines)
+#   - idah-image:circle        (circle outlines)
+#   - idah-image:line          (line strokes)
+#
+# Per-category masks are grayscale (white = shape, black = background).
+# A combined RGB mask is also generated showing each category in a distinct color.
 #
 # Usage:
-#   ruby scripts/upd_mask_to_png/main.rb \
+#   ruby main.rb \
 #     --input /path/to/export.upd \
-#     --output-dir /path/to/output_masks/
+#     --output-dir /path/to/output_masks/ \
+#     --shape-types mask,bounding-box,circle,line
 
 require "json"
 require "base64"
@@ -32,10 +40,10 @@ end
 class RleDecoder
   MAX_RUN_LENGTH = 32_767
 
-  # Decode an RLE base64 string back into a flat binary array (0s and 1s).
-  def decode(rle, w, h)
+  # Decode an RLE base64 string back into a flat binary string of 0/1 bytes.
+  def decode_to_string(rle, w, h)
     total = w * h
-    return Array.new(total, 0) if total == 0 || rle.nil? || rle.empty?
+    return "\x00" * total if total == 0 || rle.nil? || rle.empty?
 
     bytes = rle.unpack1("m0").bytes
 
@@ -48,20 +56,20 @@ class RleDecoder
             "RLE data exceeds tile size: sum of explicit runs (#{sum_explicit}) > total pixels (#{total})"
     end
 
-    buffer = Array.new(total, 0)
+    buffer = "\x00" * total
     offset = 0
     bit = 0
 
     explicit_runs.each do |run|
       if bit == 1
-        run.times { |j| buffer[offset + j] = 1 }
+        run.times { |j| buffer.setbyte(offset + j, 1) }
       end
       offset += run
       bit = 1 - bit
     end
 
     if bit == 1 && implicit_len > 0
-      implicit_len.times { |j| buffer[offset + j] = 1 }
+      implicit_len.times { |j| buffer.setbyte(offset + j, 1) }
     end
 
     buffer
@@ -115,10 +123,18 @@ class UpdCli
   end
 
   # Show a single annotation (returns its JSON).
-  # Output format: "2026-... INFO - annotation.show: {"id":"...","entry_id":"...","shape_type":"...","shape_args":{...},"category":"...","properties":{...}}"
+  # Output format: "2026-... INFO - annotation.show:
+  # {"id":"...","entry_id":"...","shape_type":"...","shape_args":{...},"category":"...","properties":{...}}"
   def show_annotation(upd_file, annotation_id)
     output = run_cmd("#{@cli} --input #{Shellwords.escape(upd_file)} annotation show --id #{Shellwords.escape(annotation_id)}")
     parse_json_from_log(output)
+  end
+  # List all annotations with full data in a single subprocess call.
+  # Returns an array of annotation hashes with keys: id, entry_id, shape_type,
+  # annotation (Hash), shape_args (Hash), metadata (Hash or nil).
+  def list_annotations_full(upd_file)
+    output = run_cmd("#{@cli} --input #{Shellwords.escape(upd_file)} annotation list")
+    parse_full_annotation_list(output)
   end
 
   private
@@ -218,11 +234,182 @@ class UpdCli
     end
     ids
   end
+# Parse full annotation data from annotation list output.
+  # Each line has format: "2026-... INFO - annotation.list: <json>"
+  # Returns array of annotation hashes with all fields from the query.
+  def parse_full_annotation_list(output)
+    annotations = []
+    output.each_line do |line|
+      stripped = line.strip
+      next if stripped.empty?
+      next if stripped.include?("No annotation found") || stripped.include?("No entries found")
+
+      colon_idx = stripped.index(": ")
+      next unless colon_idx
+      json_str = stripped[(colon_idx + 2)..]
+      next if json_str.nil? || json_str.empty?
+
+      begin
+        data = JSON.parse(json_str)
+        annotations << data if data["id"]
+      rescue JSON::ParserError
+        # skip unparseable lines
+      end
+    end
+    annotations
+  end
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mask Decoder (tile assembly → full image)
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Shape Renderer (bounding-box, circle, line → binary mask)
+# ─────────────────────────────────────────────────────────────────────────────
+class ShapeRenderer
+  # Render a bounding box outline (border only, interior transparent).
+  #
+  # @param width  [Integer] image width in pixels
+  # @param height [Integer] image height in pixels
+  # @param points [Array<Array<Float>>] 4 normalized corner points [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+  # @return [String] flat byte string of length width*height (0 = bg, 1 = shape)
+  def self.bounding_box(width, height, points)
+    pixel_coords = points.map { |x, y| [ (x * width).round, (y * height).round ] }
+    xs = pixel_coords.map(&:first)
+    ys = pixel_coords.map(&:last)
+    min_x = xs.min
+    max_x = xs.max
+    min_y = ys.min
+    max_y = ys.max
+
+    # Clamp to image bounds
+    min_x = 0 if min_x < 0
+    min_y = 0 if min_y < 0
+    max_x = width - 1 if max_x >= width
+    max_y = height - 1 if max_y >= height
+
+    image = "\x00".b * (width * height)
+
+    # Draw top 2 rows and bottom 2 rows
+    (min_x..max_x).each do |x|
+      y = min_y
+      image.setbyte(y * width + x, 1) if y >= 0 && y < height
+      y = min_y + 1
+      image.setbyte(y * width + x, 1) if y >= 0 && y < height
+      y = max_y - 1
+      image.setbyte(y * width + x, 1) if y >= 0 && y < height
+      y = max_y
+      image.setbyte(y * width + x, 1) if y >= 0 && y < height
+    end
+    # Draw left 2 cols and right 2 cols
+    (min_y..max_y).each do |y|
+      x = min_x
+      image.setbyte(y * width + x, 1) if x >= 0 && x < width
+      x = min_x + 1
+      image.setbyte(y * width + x, 1) if x >= 0 && x < width
+      x = max_x - 1
+      image.setbyte(y * width + x, 1) if x >= 0 && x < width
+      x = max_x
+      image.setbyte(y * width + x, 1) if x >= 0 && x < width
+    end
+
+    image
+  end
+
+  # Render a circle outline (border only, interior transparent).
+  #
+  # @param width  [Integer] image width in pixels
+  # @param height [Integer] image height in pixels
+  # @param center [Array<Float>] normalized center [cx, cy]
+  # @param radius [Float] normalized radius
+  # @return [String] flat byte string of length width*height (0 = bg, 1 = shape)
+  def self.circle(width, height, center, radius)
+    cx = (center[0] * width).round
+    cy = (center[1] * height).round
+    r  = (radius * [width, height].max).round
+    r  = 1 if r < 1
+
+    image = "\x00".b * (width * height)
+
+    # Bounding box of the circle
+    min_y = [cy - r, 0].max
+    max_y = [cy + r, height - 1].min
+    min_x = [cx - r, 0].max
+    max_x = [cx + r, width - 1].min
+
+    r2 = r * r
+    inner2 = (r - 0.5) * (r - 0.5)
+    outer2 = (r + 0.5) * (r + 0.5)
+    # Draw only pixels within 1 pixel of the true radius (outline)
+    (min_y..max_y).each do |y|
+      dy = y - cy
+      dy2 = dy * dy
+      base = y * width
+      (min_x..max_x).each do |x|
+        dx = x - cx
+        dist2 = dx * dx + dy2
+        if dist2 >= inner2 && dist2 <= outer2
+          image.setbyte(base + x, 1)
+        end
+      end
+    end
+
+    image
+  end
+
+  # Render a 2-pixel-wide line from two normalized endpoints.
+  # Uses a distance-based approach for uniform thickness in all directions.
+  #
+  # @param width  [Integer] image width in pixels
+  # @param height [Integer] image height in pixels
+  # @param point_a [Array<Float>] normalized [x, y] start
+  # @param point_b [Array<Float>] normalized [x, y] end
+  # @return [String] flat byte string of length width*height (0 = bg, 1 = shape)
+  def self.line(width, height, point_a, point_b)
+    x0 = (point_a[0] * width).round
+    y0 = (point_a[1] * height).round
+    x1 = (point_b[0] * width).round
+    y1 = (point_b[1] * height).round
+
+    image = "\x00".b * (width * height)
+
+    # Compute bounding box of the line with 2px margin
+    min_x = [x0, x1].min - 2
+    max_x = [x0, x1].max + 2
+    min_y = [y0, y1].min - 2
+    max_y = [y0, y1].max + 2
+
+    # Clamp to image bounds
+    min_x = 0 if min_x < 0
+    min_y = 0 if min_y < 0
+    max_x = width - 1 if max_x >= width
+    max_y = height - 1 if max_y >= height
+
+    dx = x1 - x0
+    dy = y1 - y0
+    len2 = dx * dx + dy * dy
+
+    (min_y..max_y).each do |y|
+      base = y * width
+      (min_x..max_x).each do |x|
+        # Distance from point (x,y) to line segment (x0,y0)-(x1,y1)
+        if len2 == 0
+          dist = Math.sqrt((x - x0) * (x - x0) + (y - y0) * (y - y0))
+        else
+          t = ((x - x0) * dx + (y - y0) * dy).to_f / len2
+          t = 0.0 if t < 0.0
+          t = 1.0 if t > 1.0
+          proj_x = x0 + t * dx
+          proj_y = y0 + t * dy
+          dist = Math.sqrt((x - proj_x) * (x - proj_x) + (y - proj_y) * (y - proj_y))
+        end
+        image.setbyte(base + x, 1) if dist <= 1.5
+      end
+    end
+
+    image
+  end
+end
 class MaskDecoder
   TILE_SIZE = 128
 
@@ -230,15 +417,18 @@ class MaskDecoder
     @rle_decoder = RleDecoder.new
   end
 
-  # Decode a binary mask annotation into a 2D pixel array.
+  # Decode a binary mask annotation into a flat byte string.
   #
   # @param shape [Hash] tile data from the annotation shape
   #   Format: { "tile-0x0" => { "rle" => "base64..." }, ... }
   # @param width [Integer] full image width
   # @param height [Integer] full image height
-  # @return [Array<Array<Integer>>] 2D array [y][x] of 0/1 values
+  # @return [String] flat byte string length width*height (0 = bg, 1 = shape)
   def decode(shape, width, height)
-    image = Array.new(height) { Array.new(width, 0) }
+    total = width * height
+    return "\x00".b * total if total == 0 || shape.nil? || shape.empty?
+
+    image = "\x00".b * total
 
     n_cols = (width.to_f / TILE_SIZE).ceil
     n_rows = (height.to_f / TILE_SIZE).ceil
@@ -253,17 +443,19 @@ class MaskDecoder
 
         next unless rle.is_a?(String) && !rle.empty?
 
-        tile_pixels = @rle_decoder.decode(rle, TILE_SIZE, TILE_SIZE)
+        tile_pixels = @rle_decoder.decode_to_string(rle, TILE_SIZE, TILE_SIZE)
 
         TILE_SIZE.times do |py|
           img_y = row * TILE_SIZE + py
           next if img_y >= height
 
-          TILE_SIZE.times do |px|
-            img_x = col * TILE_SIZE + px
-            next if img_x >= width
+          base_idx = img_y * width + col * TILE_SIZE
+          tile_base = py * TILE_SIZE
+          row_span = [TILE_SIZE, width - col * TILE_SIZE].min
 
-            image[img_y][img_x] = tile_pixels[py * TILE_SIZE + px]
+          # Copy tile row bytes into the image buffer
+          row_span.times do |px|
+            image.setbyte(base_idx + px, 1) if tile_pixels.getbyte(tile_base + px) == 1
           end
         end
       end
@@ -277,11 +469,11 @@ end
 # PNG Writer
 # ─────────────────────────────────────────────────────────────────────────────
 class PngWriter
-  # Write a grayscale (binary) mask PNG.
-  def write(image, path)
-    height = image.length
-    width = image[0].length
-
+  # Write a grayscale (binary) mask PNG from a flat byte string.
+  # @param image [String] flat byte string of length width*height (0 = bg, 1 = shape)
+  # @param width [Integer] image width in pixels
+  # @param height [Integer] image height in pixels
+  def write(image, width, height, path)
     if HAVE_CHUNKY_PNG
       write_with_chunky_png(image, width, height, path)
     else
@@ -289,12 +481,9 @@ class PngWriter
     end
   end
 
-  # Write a combined RGB mask where each category index maps to a distinct color.
-  # The `combined_image` is a 2D array [y][x] of integer category indices (0 = background).
-  def write_combined(combined_image, path)
-    height = combined_image.length
-    width = combined_image[0].length
-
+  # Write a combined RGB mask where each byte in the flat string is a category index.
+  # @param combined_image [String] flat byte string of length width*height (0 = bg, 1+ = category)
+  def write_combined(combined_image, width, height, path)
     if HAVE_CHUNKY_PNG
       write_combined_chunky(combined_image, width, height, path)
     else
@@ -304,7 +493,7 @@ class PngWriter
 
   private
 
-  # Pre-defined palette of distinct colors (index 0 = background = black).
+  # Pre-defined palette of maximally distinct colors (index 0 = background = black).
   CATEGORY_COLORS = [
     [0, 0, 0],       # 0: background (black)
     [255, 0, 0],     # 1: red
@@ -315,13 +504,32 @@ class PngWriter
     [0, 255, 255],   # 6: cyan
     [255, 128, 0],   # 7: orange
     [128, 0, 255],   # 8: purple
-    [0, 255, 128],   # 9: spring green
-    [255, 0, 128],   # 10: rose
-    [128, 255, 0],   # 11: chartreuse
-    [0, 128, 255],   # 12: azure
-    [255, 128, 128], # 13: light red
-    [128, 255, 128], # 14: light green
-    [128, 128, 255], # 15: light blue
+    [128, 255, 0],   # 9: lime
+    [255, 0, 128],   # 10: deep pink
+    [0, 200, 128],   # 11: teal
+    [128, 64, 0],    # 12: brown
+    [0, 128, 128],   # 13: dark cyan
+    [128, 0, 0],     # 14: maroon
+    [0, 0, 128],     # 15: navy
+  ].freeze
+
+  COLOR_NAMES = [
+    "background",     # 0
+    "red",            # 1
+    "green",          # 2
+    "blue",           # 3
+    "yellow",         # 4
+    "magenta",        # 5
+    "cyan",           # 6
+    "orange",         # 7
+    "purple",         # 8
+    "lime",           # 9
+    "deep pink",      # 10
+    "teal",           # 11
+    "brown",          # 12
+    "dark cyan",      # 13
+    "maroon",         # 14
+    "navy",           # 15
   ].freeze
 
   def category_color(index)
@@ -330,32 +538,31 @@ class PngWriter
 
   def write_with_chunky_png(image, width, height, path)
     png = ChunkyPNG::Image.new(width, height)
-
-    height.times do |y|
-      width.times do |x|
-        pixel = image[y][x]
-        png[x, y] = pixel == 1 ? ChunkyPNG::Color.rgb(255, 255, 255) : ChunkyPNG::Color.rgb(0, 0, 0)
-      end
+    total = width * height
+    total.times do |i|
+      y = i / width
+      x = i % width
+      pixel = image.getbyte(i)
+      png[x, y] = pixel == 1 ? ChunkyPNG::Color.rgb(255, 255, 255) : ChunkyPNG::Color.rgb(0, 0, 0)
     end
-
     png.save(path)
   end
 
   def write_combined_chunky(combined_image, width, height, path)
     png = ChunkyPNG::Image.new(width, height)
-
-    height.times do |y|
-      width.times do |x|
-        idx = combined_image[y][x]
-        r, g, b = category_color(idx)
-        png[x, y] = ChunkyPNG::Color.rgb(r, g, b)
-      end
+    total = width * height
+    total.times do |i|
+      y = i / width
+      x = i % width
+      idx = combined_image.getbyte(i)
+      r, g, b = category_color(idx)
+      png[x, y] = ChunkyPNG::Color.rgb(r, g, b)
     end
-
     png.save(path)
   end
 
   # Minimal PNG writer (no external dependencies).
+  # @param image [String] flat byte string of 0/1 values
   def write_minimal_png(image, width, height, path)
     signature = [137, 80, 78, 71, 13, 10, 26, 10].pack("C*")
 
@@ -365,8 +572,9 @@ class PngWriter
     raw_data = +""
     height.times do |y|
       raw_data << 0x00 # filter byte (none)
+      row_start = y * width
       width.times do |x|
-        raw_data << (image[y][x] == 1 ? 255 : 0).chr
+        raw_data << (image.getbyte(row_start + x) == 1 ? 255 : 0).chr
       end
     end
 
@@ -382,6 +590,7 @@ class PngWriter
     end
   end
 
+  # Write combined RGB PNG from a flat byte string of category indices.
   def write_combined_minimal(combined_image, width, height, path)
     signature = [137, 80, 78, 71, 13, 10, 26, 10].pack("C*")
 
@@ -392,8 +601,9 @@ class PngWriter
     raw_data = +""
     height.times do |y|
       raw_data << 0x00 # filter byte (none)
+      row_start = y * width
       width.times do |x|
-        idx = combined_image[y][x]
+        idx = combined_image.getbyte(row_start + x)
         r, g, b = category_color(idx)
         raw_data << r.chr << g.chr << b.chr
       end
@@ -423,8 +633,20 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 # The UPD CLI stores the annotation type in the "shape_type" field of the JSON output.
-# Binary mask annotations have type: "idah-image:mask"
-SHAPE_TYPE_MASK = "idah-image:mask"
+SHAPE_TYPE_MASK          = "idah-image:mask"
+SHAPE_TYPE_BOUNDING_BOX  = "idah-image:bounding-box"
+SHAPE_TYPE_CIRCLE        = "idah-image:circle"
+SHAPE_TYPE_LINE          = "idah-image:line"
+SUPPORTED_SHAPE_TYPES    = [SHAPE_TYPE_MASK, SHAPE_TYPE_BOUNDING_BOX, SHAPE_TYPE_CIRCLE, SHAPE_TYPE_LINE].freeze
+
+# Mapping of short names (for --shape-types CLI option) to full shape type strings.
+SHAPE_TYPE_SHORT_NAMES = {
+  "mask"          => SHAPE_TYPE_MASK,
+  "bounding-box"  => SHAPE_TYPE_BOUNDING_BOX,
+  "bb"            => SHAPE_TYPE_BOUNDING_BOX,
+  "circle"        => SHAPE_TYPE_CIRCLE,
+  "line"          => SHAPE_TYPE_LINE,
+}.freeze
 
 def main
   options = parse_options
@@ -437,16 +659,52 @@ def main
   output_dir = options[:output_dir]
   FileUtils.mkdir_p(output_dir)
 
-  # Step 1: List all entries and annotations
-  entries = updcli.list_entry_ids(options[:input])
-  annotation_ids = updcli.list_annotation_ids(options[:input])
+  # ───────────────────────────────────────────────────────────────────────
+  # Step 1: Fetch all annotations in a single subprocess call (BIG WIN).
+  # The `annotation list` command already returns all fields needed:
+  # id, entry_id, shape_type, annotation (category), shape_args (tile RLE,
+  # points, etc.), and metadata — no per-annotation subprocess needed.
+  # ───────────────────────────────────────────────────────────────────────
+  puts "  Fetching all annotations..."
+  all_annotations = updcli.list_annotations_full(options[:input])
+  puts "  Found #{all_annotations.length} annotations"
 
-  puts "  Found #{entries.length} entries, #{annotation_ids.length} annotations"
+  # Filter out unsupported shape types early
+  all_annotations = all_annotations.select do |ann|
+    st = ann["shape_type"] || ""
+    SUPPORTED_SHAPE_TYPES.include?(st)
+  end
 
-  # Step 2: Fetch entry metadata (build a map entry_id → name + dimensions)
-  # The entry show output has: { "id" => "...", "metadata" => { "name" => "...", "width" => ..., "height" => ... } }
+  # Filter by --shape-types when specified
+  if options[:shape_types]
+    all_annotations = all_annotations.select do |ann|
+      options[:shape_types].include?(ann["shape_type"])
+    end
+  end
+
+  # Filter by --entry-ids when specified
+  if options[:entry_ids]
+    selected = options[:entry_ids]
+    all_annotations = all_annotations.select { |ann| selected.include?(ann["entry_id"]) }
+  end
+
+  puts "  Processing #{all_annotations.length} supported annotations..."
+
+  # Group annotations by entry_id for per-entry processing
+  annotations_by_entry = {}
+  all_annotations.each do |ann|
+    eid = ann["entry_id"]
+    next unless eid
+    annotations_by_entry[eid] ||= []
+    annotations_by_entry[eid] << ann
+  end
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Step 2: Collect all entry IDs and fetch entry metadata
+  # ───────────────────────────────────────────────────────────────────────
+  entry_ids = annotations_by_entry.keys
   entry_info = {}
-  entries.each do |eid|
+  entry_ids.each do |eid|
     entry_data = updcli.show_entry(options[:input], eid)
     next unless entry_data
 
@@ -462,101 +720,14 @@ def main
     }
   end
 
-  # Step 3: Fetch and decode all mask annotations, grouped by entry_id
-  # Each entry in the map: entry_id => { entry_name:, width:, height:, masks: [...] }
-  entry_masks = {}
-  skipped = 0
-
-  annotation_ids.each do |aid|
-    annotation = updcli.show_annotation(options[:input], aid)
-    next unless annotation
-
-    # Check if it's a mask annotation — the type is in "shape_type"
-    shape_type = annotation["shape_type"] || ""
-    unless shape_type == SHAPE_TYPE_MASK
-      skipped += 1
-      next
-    end
-
-    # Get entry_id directly from annotation response
-    entry_id = annotation["entry_id"]
-    unless entry_id
-      warn "  ⚠ Skipping annotation #{aid}: no entry_id"
-      skipped += 1
-      next
-    end
-
-    info = entry_info[entry_id]
-    entry_name = info ? info[:name] : entry_id
-
-    # Determine category from annotation data
-    category = annotation["category"] || ""
-
-    # Get shape data — filter out non-tile keys (e.g. "points")
-    shape = (annotation["shape_args"] || {}).select { |k, _| k.start_with?("tile-") }
-
-    # Determine the full image dimensions.
-    # Prefer the entry's dimensions from entry metadata (authoritative full image size),
-    # then fall back to annotation metadata, then infer from tile keys.
-    if info && info[:width] && info[:height] && info[:width] > 0 && info[:height] > 0
-      width = info[:width]
-      height = info[:height]
-    else
-      ann_metadata = annotation["metadata"] || {}
-      width = normalize_dim_value(ann_metadata["width"]) || normalize_dim_value(ann_metadata["Width"])
-      height = normalize_dim_value(ann_metadata["height"]) || normalize_dim_value(ann_metadata["Height"])
-
-      if width.nil? || height.nil? || width <= 0 || height <= 0
-        # Fallback: infer from tile keys
-        tile_keys = shape.keys.select { |k| k.start_with?("tile-") }
-        if tile_keys.any?
-          max_col = 0
-          max_row = 0
-          tile_keys.each do |key|
-            m = key.match(/tile-(\d+)x(\d+)/)
-            next unless m
-            max_col = m[1].to_i if m[1].to_i > max_col
-            max_row = m[2].to_i if m[2].to_i > max_row
-          end
-          width  = (max_col + 1) * 128
-          height = (max_row + 1) * 128
-        else
-          warn "  ⚠ Skipping annotation #{aid}: no tile data found"
-          skipped += 1
-          next
-        end
-      end
-    end
-
-    # Decode mask at the full entry image dimensions
-    puts "  Decoding mask for entry '#{entry_name}', category '#{category}' (#{width}x#{height})"
-    begin
-      image = decoder.decode(shape, width, height)
-
-      # Group by entry_id
-      entry_masks[entry_id] ||= { entry_name: entry_name, width: 0, height: 0, masks: [] }
-      entry_masks[entry_id][:width] = [entry_masks[entry_id][:width], width].max
-      entry_masks[entry_id][:height] = [entry_masks[entry_id][:height], height].max
-      entry_masks[entry_id][:masks] << {
-        category: category,
-        image: image,
-        width: width,
-        height: height
-      }
-    rescue => e
-      warn e.full_message
-      skipped += 1
-    end
-  end
-
-  # Step 4: Build a global category-to-index mapping for consistent colors across all entries
+  # ───────────────────────────────────────────────────────────────────────
+  # Step 3: Build global category-to-index mapping for consistent colors
+  # ───────────────────────────────────────────────────────────────────────
   all_categories = []
-  entry_masks.each_value do |entry_data|
-    entry_data[:masks].each do |m|
-      cat = m[:category]
-      if cat && !cat.empty? && !all_categories.include?(cat)
-        all_categories << cat
-      end
+  all_annotations.each do |ann|
+    cat = ann["category"] || ""
+    if cat && !cat.empty? && !all_categories.include?(cat)
+      all_categories << cat
     end
   end
   global_category_indices = {}
@@ -564,19 +735,160 @@ def main
     global_category_indices[cat] = idx + 1
   end
 
-  # Step 5: Write individual mask files (per-category subfolders) and combined masks
+  # Write category colors reference file
+  colors_path = File.join(output_dir, "category_colors.txt")
+  File.open(colors_path, "w") do |f|
+    f.puts "Category-to-Color Mapping for Combined Masks"
+    f.puts "Generated from UPD file: #{options[:input]}"
+    f.puts "=" * 60
+    f.puts ""
+    all_categories.each_with_index do |cat, idx|
+      color_idx = idx + 1
+      rgb = PngWriter::CATEGORY_COLORS[color_idx % PngWriter::CATEGORY_COLORS.length]
+      hex = "#%02x%02x%02x" % rgb
+      f.puts "  #{cat.ljust(30)} → #{hex}"
+    end
+    f.puts ""
+    f.puts "Note: Index 0 (black / #000000) is reserved for non-masked areas."
+  end
+  puts "  → #{colors_path}"
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Step 4: Process each entry one at a time (memory-efficient).
+  #
+  # For each entry:
+  #   1. Decode/render each annotation into a flat byte string
+  #   2. Merge into per-category buffer (immediate OR, no individual storage)
+  #   3. Collect shape info for combined mask (shape_type, category, image)
+  #   4. Write per-category PNGs
+  #   5. Build combined mask (filled shapes first, then outlines on top)
+  #   6. Write combined PNG
+  #   7. Free all memory for this entry before processing the next
+  # ───────────────────────────────────────────────────────────────────────
   success = 0
   combined_count = 0
+  skipped = 0
 
-  entry_masks.each_value do |entry_data|
-    entry_name = entry_data[:entry_name]
-    masks = entry_data[:masks]
+  annotations_by_entry.each do |entry_id, entry_annotations|
+    info = entry_info[entry_id]
+    entry_name = info ? info[:name] : entry_id
 
-    # Write individual category masks into category-named subfolders
-    masks.each do |mask_data|
-      category = mask_data[:category]
-      image = mask_data[:image]
+    # Per-category merged buffers: category_name => flat byte String
+    cat_buffers = {}
+    # Track shapes for combined mask: [{ category:, shape_type:, image: }]
+    shapes_for_combined = []
 
+    entry_annotations.each do |annotation|
+      aid = annotation["id"]
+      shape_type = annotation["shape_type"] || ""
+      category = annotation["category"] || ""
+      shape_args = annotation["shape_args"] || {}
+
+      # Extract shape data (tile keys for masks, full args for others)
+      if shape_type == SHAPE_TYPE_MASK
+        shape = shape_args.select { |k, _| k.start_with?("tile-") }
+      else
+        shape = shape_args
+      end
+
+      # Determine image dimensions
+      width, height = nil, nil
+      if info && info[:width] && info[:height] && info[:width] > 0 && info[:height] > 0
+        width = info[:width]
+        height = info[:height]
+      else
+        ann_metadata = annotation["metadata"] || {}
+        width = normalize_dim_value(ann_metadata["width"]) || normalize_dim_value(ann_metadata["Width"])
+        height = normalize_dim_value(ann_metadata["height"]) || normalize_dim_value(ann_metadata["Height"])
+
+        if width.nil? || height.nil? || width <= 0 || height <= 0
+          if shape_type == SHAPE_TYPE_MASK
+            tile_keys = shape.keys.select { |k| k.start_with?("tile-") }
+            if tile_keys.any?
+              max_col = 0
+              max_row = 0
+              tile_keys.each do |key|
+                m = key.match(/tile-(\d+)x(\d+)/)
+                next unless m
+                max_col = m[1].to_i if m[1].to_i > max_col
+                max_row = m[2].to_i if m[2].to_i > max_row
+              end
+              width = (max_col + 1) * 128
+              height = (max_row + 1) * 128
+            else
+              warn "  ⚠ Skipping annotation #{aid}: no tile data found"
+              skipped += 1
+              next
+            end
+          else
+            warn "  ⚠ Skipping annotation #{aid}: cannot determine image dimensions"
+            skipped += 1
+            next
+          end
+        end
+      end
+
+      puts "  [entry #{entry_name}] Processing #{shape_type} category '#{category}' (#{width}x#{height})"
+      begin
+        # Decode/render shape into flat byte string
+        image = case shape_type
+                when SHAPE_TYPE_MASK
+                  decoder.decode(shape, width, height)
+                when SHAPE_TYPE_BOUNDING_BOX
+                  points = shape["points"] || []
+                  ShapeRenderer.bounding_box(width, height, points)
+                when SHAPE_TYPE_CIRCLE
+                  center = shape["points"][0] || [0, 0]
+                  radius = shape["radius"] || 0
+                  ShapeRenderer.circle(width, height, center, radius)
+                when SHAPE_TYPE_LINE
+                  points = shape["points"] || []
+                  point_a = points[0] || [0, 0]
+                  point_b = points[1] || [0, 0]
+                  ShapeRenderer.line(width, height, point_a, point_b)
+                else
+                  raise "Unsupported shape type: #{shape_type}"
+                end
+
+        # Merge into per-category buffer (OR operation)
+        if category && !category.empty?
+          cat_buffers[category] ||= "\x00".b * (width * height)
+          cat_buf = cat_buffers[category]
+          total = width * height
+          total.times do |i|
+            cat_buf.setbyte(i, 1) if image.getbyte(i) == 1
+          end
+        end
+
+        # Store shape info for the combined mask (preserves process order,
+        # which is used to draw filled masks before outline shapes)
+        shapes_for_combined << {
+          category: category,
+          shape_type: shape_type,
+          image: image,
+          width: width,
+          height: height
+        }
+      rescue => e
+        warn e.full_message
+        skipped += 1
+      end
+    end # entry_annotations.each
+
+    # Determine effective entry dimensions (entry metadata, else from shapes)
+    entry_width = info && info[:width] ? info[:width] : 0
+    entry_height = info && info[:height] ? info[:height] : 0
+    if entry_width == 0 || entry_height == 0
+      if shapes_for_combined.any?
+        entry_width = shapes_for_combined.first[:width]
+        entry_height = shapes_for_combined.first[:height]
+      end
+    end
+
+    # ───────────────────────────────────────────────────────────────────
+    # Write per-category PNGs (each category is a fully merged grayscale mask)
+    # ───────────────────────────────────────────────────────────────────
+    cat_buffers.each do |category, buffer|
       if category && !category.empty?
         safe_category = category.tr("/", "_")
         cat_dir = File.join(output_dir, safe_category)
@@ -586,45 +898,45 @@ def main
         output_path = File.join(output_dir, "#{entry_name}.png")
       end
 
-      writer.write(image, output_path)
+      writer.write(buffer, entry_width, entry_height, output_path)
       puts "    → #{output_path}"
       success += 1
     end
 
-    # Generate a combined mask with each category shown in a different color.
-    # Every entry with at least one category gets a combined mask.
-    categorized_masks = masks.select { |m| m[:category] && !m[:category].empty? }
-    next if categorized_masks.empty?
+    # ───────────────────────────────────────────────────────────────────
+    # Build and write combined RGB mask
+    # ───────────────────────────────────────────────────────────────────
+    categorized_shapes = shapes_for_combined.select { |s| s[:category] && !s[:category].empty? }
+    if categorized_shapes.any?
+      total = entry_width * entry_height
+      combined = "\x00".b * total
 
-    # Use the entry's full dimensions for the combined mask
-    combined = Array.new(entry_data[:height]) { Array.new(entry_data[:width], 0) }
+      # Sort: filled masks first, outline shapes on top (overwrite masks)
+      sorted_shapes = categorized_shapes.sort_by { |s| s[:shape_type] == SHAPE_TYPE_MASK ? 0 : 1 }
 
-    # Merge each category mask into the combined image using its global color index
-    categorized_masks.each do |m|
-      idx = global_category_indices[m[:category]] || 1
-      h = m[:height]
-      w = m[:width]
-      h.times do |y|
-        next if y >= entry_data[:height]
-        w.times do |x|
-          next if x >= entry_data[:width]
-          combined[y][x] = idx if m[:image][y][x] == 1
+      sorted_shapes.each do |s|
+        idx = global_category_indices[s[:category]] || 1
+        img = s[:image]
+        total.times do |i|
+          combined.setbyte(i, idx) if img.getbyte(i) == 1
         end
       end
+
+      combined_dir = File.join(output_dir, "combined")
+      FileUtils.mkdir_p(combined_dir)
+      combined_path = File.join(combined_dir, "#{entry_name}.png")
+      writer.write_combined(combined, entry_width, entry_height, combined_path)
+      puts "    → #{combined_path} (combined, #{categorized_shapes.length} shapes)"
+      combined_count += 1
     end
 
-    # Write combined mask in a combined/ subfolder
-    combined_dir = File.join(output_dir, "combined")
-    FileUtils.mkdir_p(combined_dir)
-    combined_path = File.join(combined_dir, "#{entry_name}.png")
-    writer.write_combined(combined, combined_path)
-    puts "    → #{combined_path} (combined, #{categorized_masks.length} categories)"
-    combined_count += 1
-  end
+    # Free memory for this entry before processing the next
+    cat_buffers.clear
+    shapes_for_combined.clear
+  end # annotations_by_entry.each
 
   puts "\nDone: #{success} individual mask(s) extracted, #{combined_count} combined mask(s) generated, #{skipped} skipped"
 end
-
 def normalize_dim_value(val)
   return nil if val.nil?
   val = val.to_s.strip
@@ -658,6 +970,24 @@ def parse_options
 
     opts.on("--updcli PATH", "Path to updcli binary (default: updcli)") do |v|
       options[:updcli] = v
+    end
+
+    opts.on("--shape-types TYPES", "Comma-separated shape types to include (default: all). " \
+                                   "Options: mask, bounding-box (bb), circle, line. " \
+                                   "Example: --shape-types mask,bounding-box") do |v|
+      selected = v.split(",").map(&:strip).map(&:downcase)
+      types = selected.map { |s| SHAPE_TYPE_SHORT_NAMES[s] }
+      missing = selected.zip(types).select { |_, t| t.nil? }.map(&:first)
+      unless missing.empty?
+        puts "Unknown shape type(s): #{missing.join(', ')}. Valid options: #{SHAPE_TYPE_SHORT_NAMES.keys.join(', ')}"
+        exit 1
+      end
+      options[:shape_types] = types
+    end
+
+    opts.on("--entry-ids IDS", "Comma-separated entry IDs to process (default: all). " \
+                               "Example: --entry-ids 019fc610-930c-713c-8783-82e91bbb35ef,019fc611-...") do |v|
+      options[:entry_ids] = v.split(",").map(&:strip)
     end
 
     opts.on("-h", "--help", "Print help") do
