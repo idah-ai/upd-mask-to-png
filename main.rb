@@ -123,7 +123,8 @@ class UpdCli
   end
 
   # Show a single annotation (returns its JSON).
-  # Output format: "2026-... INFO - annotation.show: {"id":"...","entry_id":"...","shape_type":"...","annotation":{...}}"
+  # Output format: "2026-... INFO - annotation.show:
+  # {"id":"...","entry_id":"...","shape_type":"...","shape_args":{...},"category":"...","properties":{...}}"
   def show_annotation(upd_file, annotation_id)
     output = run_cmd("#{@cli} --input #{Shellwords.escape(upd_file)} annotation show --id #{Shellwords.escape(annotation_id)}")
     parse_json_from_log(output)
@@ -203,7 +204,7 @@ class UpdCli
   #
   # For entry list, output is plain UUIDs per line.
   # For annotation list, output is JSON-per-line with log prefix:
-  #   2026-... INFO - annotation.list: {"id":"...","shape_type":"...","annotation":{...}}
+  #   2026-... INFO - annotation.list: {"id":"...","shape_type":"...","shape_args":{...},"category":"...","properties":{...}}
   #
   # @param json [Boolean] if true, parse JSON from each line after the log prefix
   def parse_id_list(output, json: false)
